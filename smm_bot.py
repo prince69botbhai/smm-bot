@@ -65,8 +65,8 @@ PAYMENT_INFO = (
 SUPPORT_TEXT = (
     "📞 *Support*\n\n"
     "যেকোনো সমস্যায় যোগাযোগ করুন:\n"
-    "Telegram: @your_username\n"
-    "WhatsApp: 01826065271"
+    "Telegram: @@ZEROX9TX\n"
+    "WhatsApp: 01XXXXXXXXX"
 )
 
 # price per 1000 units, in Taka — edit freely
@@ -435,6 +435,15 @@ def main():
     if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
         print("⚠️  BOT_TOKEN সেট করুন smm_bot.py ফাইলের উপরে!")
         return
+
+    # Ensure an asyncio event loop exists in the main thread.
+    # (Newer Python versions no longer create one automatically, which
+    # causes "RuntimeError: There is no current event loop" on some hosts.)
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     # start the keep-alive web server in a background thread
     threading.Thread(target=run_keep_alive, daemon=True).start()
