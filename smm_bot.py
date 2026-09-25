@@ -1,31 +1,41 @@
 """
-SMM Service Shop Bot (Telegram)
---------------------------------
+SMM Service Shop Bot (Telegram) — v2
+-------------------------------------
 Menu-driven bot for selling followers/likes/views services.
-- Manual deposit approval (bKash/Nagad + Transaction ID -> admin approves)
-- Manual order delivery (admin fulfills orders by hand, bot just collects & notifies)
+
+What's new in v2:
+- Inline buttons everywhere (no more reply-keyboard text matching -> "Back"
+  button now always works correctly, since every button has a fixed id).
+- User state (what step someone is on, mid-order) is saved to data.json,
+  so a server restart does not lose someone's in-progress order.
+- /cancel command — abandons whatever the user was doing and returns to
+  the main menu.
+- Link validation — rejects text that isn't a real http(s) link before
+  accepting it as the order's profile/post/video link.
 
 SETUP:
-1. pip install python-telegram-bot==21.4
+1. pip install python-telegram-bot==21.4 Flask==3.0.3
 2. Fill in BOT_TOKEN and ADMIN_ID below.
-3. Edit PRICES and PAYMENT_INFO to match your business.
-4. Run: python smm_bot.py
+3. Edit PRICES, MIN_ORDER and PAYMENT_INFO to match your business.
+4. Run: python smm_bot_v2.py
 
-Data is stored in data.json in the same folder (users, balances, orders, deposits).
+Data is stored in data.json in the same folder (users, orders, deposits, state).
 """
 
 import json
 import os
+import re
 import logging
 import threading
 from datetime import datetime
 
 from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -34,9 +44,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============ KEEP-ALIVE WEB SERVER (for Render free Web Service) ============
-# Render's free tier only allows "Web Service" type, which needs to respond to
-# HTTP requests on a port. This tiny Flask server does nothing but say "OK" so
-# Render is happy, and so an external pinger (UptimeRobot) can keep it awake.
 keep_alive_app = Flask(__name__)
 
 
@@ -58,16 +65,55 @@ PAYMENT_INFO = (
     "💰 *Deposit করার নিয়ম*\n\n"
     "বিকাশ (Personal): 01822348279\n"
     "নগদ (Personal): 01XXXXXXXXX\n\n"
-    "টাকা পাঠানোর পর Transaction ID (TrxID) এখানে পাঠান।\n"
+    "টাকা পাঠানোর পর Transaction ID (TrxID) এখানে লিখে পাঠান।\n"
     "উদাহরণ: `TRX123ABC456`"
 )
 
 SUPPORT_TEXT = (
     "📞 *Support*\n\n"
     "যেকোনো সমস্যায় যোগাযোগ করুন:\n"
-    "Telegram: @@ZEROX9TX\n"
-    "WhatsApp: 01XXXXXXXXX"
+    "Telegram: @ZEROX9TX\n"
+    "WhatsApp: 01822348279"
 )
+
+# platform key -> {label, emoji, services: [service names]}
+PLATFORMS = {
+    "tiktok": {
+        "label": "TikTok",
+        "emoji": "🎵",
+        "services": ["TikTok Like", "TikTok Views", "TikTok Follower", "TikTok Share"],
+    },
+    "facebook": {
+        "label": "Facebook",
+        "emoji": "🔵",
+        "services": ["Facebook Follower", "Facebook Post React", "Facebook Video View"],
+    },
+    "instagram": {
+        "label": "Instagram",
+        "emoji": "📸",
+        "services": ["Instagram Follower", "Instagram Like"],
+    },
+    "telegram": {
+        "label": "Telegram",
+        "emoji": "✈️",
+        "services": [
+            "Telegram Member",
+            "Telegram Lifetime Member",
+            "Telegram Post View",
+            "Telegram Post React",
+        ],
+    },
+    "youtube": {
+        "label": "YouTube",
+        "emoji": "🎥",
+        "services": ["YouTube Views", "YouTube Subscriber", "Premium Service"],
+    },
+    "twitter": {
+        "label": "Twitter",
+        "emoji": "🐦",
+        "services": ["Twitter Follower"],
+    },
+}
 
 # price per 1000 units, in Taka — edit freely
 PRICES = {
@@ -111,14 +157,8 @@ MIN_ORDER = {
     "Twitter Follower": 100,
 }
 
-PLATFORM_SERVICES = {
-    "🎵 TikTok": ["TikTok Like", "TikTok Views", "TikTok Follower", "TikTok Share"],
-    "🔵 Facebook": ["Facebook Follower", "Facebook Post React", "Facebook Video View"],
-    "📸 Instagram": ["Instagram Follower", "Instagram Like"],
-    "✈️ Telegram": ["Telegram Member", "Telegram Lifetime Member", "Telegram Post View", "Telegram Post React"],
-    "🎥 YouTube": ["YouTube Views", "YouTube Subscriber", "Premium Service"],
-    "🐦 Twitter": ["Twitter Follower"],
-}
+# a basic but solid http(s) URL check
+URL_RE = re.compile(r"^https?://[^\s/$.?#].[^\s]*$", re.IGNORECASE)
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
@@ -126,9 +166,11 @@ DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
 
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {"users": {}, "orders": [], "deposits": []}
+        return {"users": {}, "orders": [], "deposits": [], "state": {}}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    data.setdefault("state", {})
+    return data
 
 
 def save_data(data):
@@ -144,64 +186,195 @@ def get_user(data, user_id, name=""):
     return data["users"][uid]
 
 
-# ============ STATE (in-memory, simple) ============
-# tracks what each user is currently doing: awaiting link, awaiting quantity, awaiting trxid, etc.
-user_state = {}
-
-# ============ KEYBOARDS ============
-
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("🟢 Buy Service"), KeyboardButton("💰 Deposit")],
-        [KeyboardButton("📜 Service Price"), KeyboardButton("👤 My Profile")],
-        [KeyboardButton("📞 Support")],
-    ],
-    resize_keyboard=True,
-)
-
-PLATFORM_MENU = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("🎵 TikTok"), KeyboardButton("🔵 Facebook")],
-        [KeyboardButton("📸 Instagram"), KeyboardButton("✈️ Telegram")],
-        [KeyboardButton("🎥 YouTube"), KeyboardButton("🐦 Twitter")],
-        [KeyboardButton("⬅️ BACK মেইন মেনু")],
-    ],
-    resize_keyboard=True,
-)
+def get_state(data, user_id):
+    return data["state"].get(str(user_id), {"step": None})
 
 
-def service_menu_for(platform_label):
-    services = PLATFORM_SERVICES[platform_label]
+def set_state(data, user_id, state):
+    data["state"][str(user_id)] = state
+    save_data(data)
+
+
+def clear_state(data, user_id):
+    data["state"].pop(str(user_id), None)
+    save_data(data)
+
+
+# ============ INLINE KEYBOARDS ============
+
+def main_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Buy Service", callback_data="buy"),
+         InlineKeyboardButton("💰 Deposit", callback_data="deposit")],
+        [InlineKeyboardButton("📜 Service Price", callback_data="price"),
+         InlineKeyboardButton("👤 My Profile", callback_data="profile")],
+        [InlineKeyboardButton("📞 Support", callback_data="support")],
+    ])
+
+
+def platforms_kb():
+    keys = list(PLATFORMS.keys())
+    rows = []
+    for i in range(0, len(keys), 2):
+        row = []
+        for k in keys[i:i + 2]:
+            p = PLATFORMS[k]
+            row.append(InlineKeyboardButton(f"{p['emoji']} {p['label']}", callback_data=f"platform:{k}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ মেইন মেনু", callback_data="main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def services_kb(platform_key):
+    services = PLATFORMS[platform_key]["services"]
     rows = []
     for i in range(0, len(services), 2):
-        chunk = services[i:i + 2]
-        rows.append([KeyboardButton(s) for s in chunk])
-    rows.append([KeyboardButton("⬅️ ব্যাক করুন")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        row = [InlineKeyboardButton(s, callback_data=f"service:{s}") for s in services[i:i + 2]]
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="buy")])
+    return InlineKeyboardMarkup(rows)
 
 
-# ============ HANDLERS ============
+def cancel_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+
+
+# ============ TEXT BUILDERS ============
+
+def price_list_text():
+    lines = ["📜 *সার্ভিস প্রাইস লিস্ট* (প্রতি ১০০০)\n"]
+    for name, price in PRICES.items():
+        min_qty = MIN_ORDER.get(name, 1)
+        lines.append(f"• {name}: ৳{price} (min: {min_qty})")
+    return "\n".join(lines)
+
+
+def profile_text(user, urec):
+    return (
+        f"👤 *প্রোফাইল*\n\n"
+        f"নাম: {user.full_name}\n"
+        f"ID: `{user.id}`\n"
+        f"ব্যালেন্স: ৳{urec['balance']}"
+    )
+
+
+# ============ COMMAND HANDLERS ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     user = update.effective_user
     get_user(data, user.id, user.full_name)
-    user_state[user.id] = {"step": None}
+    clear_state(data, user.id)
     await update.message.reply_text(
         f"স্বাগতম, {user.full_name}! 👋\nনিচের মেনু থেকে সিলেক্ট করুন।",
-        reply_markup=MAIN_MENU,
+        reply_markup=main_menu_kb(),
     )
 
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = update.effective_user
+    clear_state(data, user.id)
+    await update.message.reply_text(
+        "❌ বর্তমান কাজ বাতিল করা হয়েছে।",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ============ CALLBACK (INLINE BUTTON) HANDLER ============
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+    user = query.from_user
+    urec = get_user(data, user.id, user.full_name)
+    action = query.data
+
+    if action == "main":
+        clear_state(data, user.id)
+        await query.edit_message_text("মেইন মেনু:", reply_markup=main_menu_kb())
+        return
+
+    if action == "cancel":
+        clear_state(data, user.id)
+        await query.edit_message_text("❌ বাতিল হয়েছে।\n\nমেইন মেনু:", reply_markup=main_menu_kb())
+        return
+
+    if action == "buy":
+        clear_state(data, user.id)
+        await query.edit_message_text("প্ল্যাটফর্ম সিলেক্ট করুন:", reply_markup=platforms_kb())
+        return
+
+    if action.startswith("platform:"):
+        platform_key = action.split(":", 1)[1]
+        platform = PLATFORMS.get(platform_key)
+        if not platform:
+            await query.edit_message_text("প্ল্যাটফর্ম পাওয়া যায়নি।", reply_markup=platforms_kb())
+            return
+        await query.edit_message_text(
+            f"{platform['emoji']} {platform['label']} — সার্ভিস সিলেক্ট করুন:",
+            reply_markup=services_kb(platform_key),
+        )
+        return
+
+    if action.startswith("service:"):
+        service = action.split(":", 1)[1]
+        if service not in PRICES:
+            await query.edit_message_text("সার্ভিস পাওয়া যায়নি।", reply_markup=platforms_kb())
+            return
+        set_state(data, user.id, {"step": "awaiting_quantity", "service": service})
+        price = PRICES[service]
+        min_qty = MIN_ORDER.get(service, 1)
+        await query.edit_message_text(
+            f"🛒 {service}\n💰 প্রতি ১০০০ = ৳{price}\n📉 সর্বনিম্ন অর্ডার = {min_qty}\n\n"
+            f"🔢 কতগুলো নিতে চান? নিচে সংখ্যাটি লিখে পাঠান।",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if action == "deposit":
+        set_state(data, user.id, {"step": "awaiting_trxid"})
+        await query.edit_message_text(
+            PAYMENT_INFO + "\n\n(TrxID লিখে পাঠান)",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if action == "price":
+        await query.edit_message_text(
+            price_list_text(), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ মেইন মেনু", callback_data="main")]]),
+        )
+        return
+
+    if action == "profile":
+        await query.edit_message_text(
+            profile_text(user, urec), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ মেইন মেনু", callback_data="main")]]),
+        )
+        return
+
+    if action == "support":
+        await query.edit_message_text(
+            SUPPORT_TEXT, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ মেইন মেনু", callback_data="main")]]),
+        )
+        return
+
+
+# ============ TEXT MESSAGE HANDLER (multi-step flows) ============
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
     data = load_data()
     urec = get_user(data, user.id, user.full_name)
-    state = user_state.setdefault(user.id, {"step": None})
+    state = get_state(data, user.id)
+    step = state.get("step")
 
-    # ---- Multi-step flows first ----
-    if state.get("step") == "awaiting_trxid":
+    if step == "awaiting_trxid":
         trx_id = text
         deposit = {
             "user_id": user.id,
@@ -211,11 +384,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "time": datetime.now().isoformat(timespec="seconds"),
         }
         data["deposits"].append(deposit)
-        save_data(data)
-        state["step"] = None
+        clear_state(data, user.id)
         await update.message.reply_text(
             "✅ আপনার Transaction ID জমা হয়েছে। Admin ভেরিফাই করে ব্যালেন্স যোগ করবেন।",
-            reply_markup=MAIN_MENU,
+            reply_markup=main_menu_kb(),
         )
         await context.bot.send_message(
             ADMIN_ID,
@@ -227,16 +399,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if state.get("step") == "awaiting_quantity":
+    if step == "awaiting_quantity":
         if not text.isdigit():
-            await update.message.reply_text("দয়া করে শুধু সংখ্যা দিন (যেমন: 500)")
+            await update.message.reply_text(
+                "দয়া করে শুধু সংখ্যা দিন (যেমন: 500)", reply_markup=cancel_kb()
+            )
             return
         qty = int(text)
         service = state["service"]
         min_qty = MIN_ORDER.get(service, 1)
         if qty < min_qty:
             await update.message.reply_text(
-                f"❌ সর্বনিম্ন অর্ডার {min_qty}। আবার একটি সংখ্যা লিখুন (কমপক্ষে {min_qty}):"
+                f"❌ সর্বনিম্ন অর্ডার {min_qty}। আবার একটি সংখ্যা লিখুন (কমপক্ষে {min_qty}):",
+                reply_markup=cancel_kb(),
             )
             return
         price_per_1000 = PRICES.get(service, 0)
@@ -245,25 +420,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"❌ ব্যালেন্স অপর্যাপ্ত। প্রয়োজন: ৳{cost}, আপনার আছে: ৳{urec['balance']}\n"
                 f"আগে Deposit করুন।",
-                reply_markup=MAIN_MENU,
+                reply_markup=main_menu_kb(),
             )
-            state["step"] = None
+            clear_state(data, user.id)
             return
-        state["step"] = "awaiting_link"
-        state["quantity"] = qty
-        state["cost"] = cost
+        set_state(data, user.id, {
+            "step": "awaiting_link", "service": service, "quantity": qty, "cost": cost,
+        })
         await update.message.reply_text(
-            f"পরিমাণ: {qty}\nমূল্য: ৳{cost}\n\n🔗 এখন আপনার প্রোফাইল/পোস্ট/ভিডিওর লিংক পাঠান:"
+            f"পরিমাণ: {qty}\nমূল্য: ৳{cost}\n\n🔗 এখন আপনার প্রোফাইল/পোস্ট/ভিডিওর লিংক (http/https সহ) পাঠান:",
+            reply_markup=cancel_kb(),
         )
         return
 
-    if state.get("step") == "awaiting_link":
+    if step == "awaiting_link":
         link = text
+        if not URL_RE.match(link):
+            await update.message.reply_text(
+                "❌ এটা একটা সঠিক লিংক মনে হচ্ছে না।\n"
+                "লিংক অবশ্যই `http://` অথবা `https://` দিয়ে শুরু হতে হবে।\n"
+                "যেমন: `https://facebook.com/yourpage`\n\nআবার লিংক পাঠান:",
+                parse_mode="Markdown",
+                reply_markup=cancel_kb(),
+            )
+            return
         service = state["service"]
         qty = state["quantity"]
         cost = state["cost"]
         urec["balance"] = round(urec["balance"] - cost, 2)
-        save_data(data)
         order = {
             "user_id": user.id,
             "name": user.full_name,
@@ -275,14 +459,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "time": datetime.now().isoformat(timespec="seconds"),
         }
         data["orders"].append(order)
-        save_data(data)
-        state["step"] = None
+        clear_state(data, user.id)
         await update.message.reply_text(
             f"✅ অর্ডার সফল হয়েছে!\n\n"
             f"Service: {service}\nপরিমাণ: {qty}\nমূল্য: ৳{cost}\nলিংক: {link}\n\n"
             f"আপনার নতুন ব্যালেন্স: ৳{urec['balance']}\n"
             f"শীঘ্রই ডেলিভারি করা হবে।",
-            reply_markup=MAIN_MENU,
+            reply_markup=main_menu_kb(),
         )
         await context.bot.send_message(
             ADMIN_ID,
@@ -296,62 +479,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---- Menu navigation ----
-    if text == "🟢 Buy Service":
-        await update.message.reply_text("প্ল্যাটফর্ম সিলেক্ট করুন:", reply_markup=PLATFORM_MENU)
-        return
-
-    if text in PLATFORM_SERVICES:
-        state["platform"] = text
-        await update.message.reply_text(
-            f"{text} — সার্ভিস সিলেক্ট করুন:", reply_markup=service_menu_for(text)
-        )
-        return
-
-    if text in PRICES:
-        state["step"] = "awaiting_quantity"
-        state["service"] = text
-        price = PRICES[text]
-        min_qty = MIN_ORDER.get(text, 1)
-        await update.message.reply_text(
-            f"{text}\n💰 প্রতি ১০০০ = ৳{price}\n📉 সর্বনিম্ন অর্ডার = {min_qty}\n\n"
-            f"🔢 আপনি কতগুলো নিতে চান? (শুধু সংখ্যাটি লিখুন)"
-        )
-        return
-
-    if text in ("⬅️ ব্যাক করুন",):
-        await update.message.reply_text("প্ল্যাটফর্ম সিলেক্ট করুন:", reply_markup=PLATFORM_MENU)
-        return
-
-    if text in ("⬅️ BACK মেইন মেনু",):
-        await update.message.reply_text("মেইন মেনু:", reply_markup=MAIN_MENU)
-        return
-
-    if text == "💰 Deposit":
-        state["step"] = "awaiting_trxid"
-        await update.message.reply_text(PAYMENT_INFO, parse_mode="Markdown")
-        return
-
-    if text == "📜 Service Price":
-        lines = ["📜 *সার্ভিস প্রাইস লিস্ট* (প্রতি ১০০০)\n"]
-        for name, price in PRICES.items():
-            min_qty = MIN_ORDER.get(name, 1)
-            lines.append(f"• {name}: ৳{price} (min: {min_qty})")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return
-
-    if text == "👤 My Profile":
-        await update.message.reply_text(
-            f"👤 *প্রোফাইল*\n\nনাম: {user.full_name}\nID: `{user.id}`\nব্যালেন্স: ৳{urec['balance']}",
-            parse_mode="Markdown",
-        )
-        return
-
-    if text == "📞 Support":
-        await update.message.reply_text(SUPPORT_TEXT, parse_mode="Markdown")
-        return
-
-    await update.message.reply_text("মেনু থেকে একটি অপশন সিলেক্ট করুন।", reply_markup=MAIN_MENU)
+    # no active step -> nudge them to use the menu
+    await update.message.reply_text(
+        "মেনু থেকে একটি অপশন সিলেক্ট করুন, অথবা /start লিখুন।",
+        reply_markup=main_menu_kb(),
+    )
 
 
 # ============ ADMIN COMMANDS ============
@@ -431,14 +563,15 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("এই ইউজারের কোনো Pending অর্ডার পাওয়া যায়নি।")
 
 
+# ============ MAIN ============
+
 def main():
     if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
-        print("⚠️  BOT_TOKEN সেট করুন smm_bot.py ফাইলের উপরে!")
+        print("⚠️  BOT_TOKEN সেট করুন smm_bot_v2.py ফাইলের উপরে!")
         return
 
-    # Ensure an asyncio event loop exists in the main thread.
-    # (Newer Python versions no longer create one automatically, which
-    # causes "RuntimeError: There is no current event loop" on some hosts.)
+    # Ensure an asyncio event loop exists in the main thread
+    # (some hosts run a Python version that no longer auto-creates one).
     import asyncio
     try:
         asyncio.get_event_loop()
@@ -450,10 +583,12 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("approve", approve))
     app.add_handler(CommandHandler("pending", pending))
     app.add_handler(CommandHandler("orders", orders_cmd))
     app.add_handler(CommandHandler("done", done))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot চালু হয়েছে...")
     app.run_polling()
