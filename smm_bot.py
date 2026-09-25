@@ -17,8 +17,10 @@ Data is stored in data.json in the same folder (users, balances, orders, deposit
 import json
 import os
 import logging
+import threading
 from datetime import datetime
 
+from flask import Flask
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
@@ -31,9 +33,26 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ============ KEEP-ALIVE WEB SERVER (for Render free Web Service) ============
+# Render's free tier only allows "Web Service" type, which needs to respond to
+# HTTP requests on a port. This tiny Flask server does nothing but say "OK" so
+# Render is happy, and so an external pinger (UptimeRobot) can keep it awake.
+keep_alive_app = Flask(__name__)
+
+
+@keep_alive_app.route("/")
+def home():
+    return "Bot is running!"
+
+
+def run_keep_alive():
+    port = int(os.environ.get("PORT", 8080))
+    keep_alive_app.run(host="0.0.0.0", port=port)
+
+
 # ============ CONFIG — EDIT THESE ============
 BOT_TOKEN = "8529798413:AAFe2AKthTv_CPKgxhU9N8jEut8GDk_yla4"
-ADMIN_ID = 40200898  # Your numeric Telegram user ID (get it from @userinfobot)
+ADMIN_ID = 7190437569  # Your numeric Telegram user ID (get it from @userinfobot)
 
 PAYMENT_INFO = (
     "💰 *Deposit করার নিয়ম*\n\n"
@@ -47,7 +66,7 @@ SUPPORT_TEXT = (
     "📞 *Support*\n\n"
     "যেকোনো সমস্যায় যোগাযোগ করুন:\n"
     "Telegram: @your_username\n"
-    "WhatsApp: 01822348279"
+    "WhatsApp: 01826065271"
 )
 
 # price per 1000 units, in Taka — edit freely
@@ -416,6 +435,10 @@ def main():
     if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
         print("⚠️  BOT_TOKEN সেট করুন smm_bot.py ফাইলের উপরে!")
         return
+
+    # start the keep-alive web server in a background thread
+    threading.Thread(target=run_keep_alive, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("approve", approve))
